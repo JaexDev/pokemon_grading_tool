@@ -86,7 +86,7 @@ async def fetch_tcgplayer_data(card_name, set_name, language="English"):
                         await page.goto(url, timeout=20000) 
                         
                         try:
-                            await page.wait_for_selector('.search-result, .blank-slate', timeout=10000)
+                            await page.wait_for_selector('.search-result, .blank-slate', timeout=30000)
                             print("Page loaded successfully!")
                             
                             if await page.query_selector('.search-result'):
