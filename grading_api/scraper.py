@@ -73,6 +73,8 @@ async def fetch_tcgplayer_data(card_name, set_name, language="English"):
                         url += f"&setName={set_name.replace(' ', '-').lower()}"
                 else:
                     url = url = f"{base_url}-japan/product?productLineName=pokemon-japan&q={card_name.replace(' ', '+')}&view=grid&page=1&ProductTypeName=Cards&Rarity={rarity.replace(' ', '+')}"
+                    if set_name:
+                        url += f"&setName={set_name.replace(' ', '-').lower()}"
 
                 max_retries = 3
                 retries = 0
