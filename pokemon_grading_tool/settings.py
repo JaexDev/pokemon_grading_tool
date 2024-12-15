@@ -79,6 +79,7 @@ TEMPLATES = [
 WSGI_APPLICATION = 'pokemon_grading_tool.wsgi.application'
 
 
+
 # Database
 # https://docs.djangoproject.com/en/5.1/ref/settings/#databases
 

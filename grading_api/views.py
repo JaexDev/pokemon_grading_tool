@@ -36,26 +36,24 @@ class PokemonCardViewSet(viewsets.ModelViewSet):
 
         try:
             cards_to_fetch = [{'name': search_query, 'set': search_query, 'language': language}]
-            
             logger.info(f"Fetching TCGPlayer data for {search_query} ({language})...")
-            tcgplayer_results = scraper.fetch_all_data_concurrent(cards_to_fetch)
 
+            # Run Playwright-based scraper asynchronously
+            tcgplayer_results = asyncio.run(scraper.fetch_all_data_concurrent(cards_to_fetch))
             if not tcgplayer_results:
                 logger.error(f"Could not get TCGPlayer data for {search_query} ({language}).")
                 return Response({'error': 'Could not get TCGPlayer data'}, status=404)
 
             logger.info("Fetching eBay prices asynchronously...")
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            ebay_prices = loop.run_until_complete(scraper.get_ebay_prices_async(tcgplayer_results))
-            loop.close()
+            ebay_prices = asyncio.run(scraper.get_ebay_prices_async(tcgplayer_results))
 
+            # Processing and profit calculation remains the same
             all_cards = []
             for card_data, ebay_price in zip(tcgplayer_results, ebay_prices):
                 if ebay_price:
                     logger.info(f"Calculating profits for {card_data.get('card_name')}")
                     profit_data = scraper.calculate_profit([card_data], ebay_price)
-                    
+
                     if profit_data:
                         for card in profit_data:
                             logger.info(f"Creating or updating record for {card.get('card_name')}")
@@ -73,12 +71,8 @@ class PokemonCardViewSet(viewsets.ModelViewSet):
                                 }
                             )
                             all_cards.append(card_record)
-                    else:
-                        logger.error(f"Could not calculate profits for {card_data.get('card_name')}")
-                        continue
                 else:
                     logger.error(f"Could not get eBay data for {card_data.get('card_name')}")
-                    continue
 
             if not all_cards:
                 return Response({'error': 'No valid cards found'}, status=404)
@@ -89,11 +83,3 @@ class PokemonCardViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.error(f"An unexpected error occurred: {e}")
             return Response({'error': f'An unexpected error occurred: {e}'}, status=500)
-
-        finally:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.close()
-            except:
-                pass
