@@ -35,44 +35,33 @@ class PokemonCardViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Please provide a card or set name in query params'}, status=400)
 
         try:
-            cards_to_fetch = [{'name': search_query, 'set': search_query, 'language': language}]
             logger.info(f"Fetching TCGPlayer data for {search_query} ({language})...")
 
             # Run Playwright-based scraper asynchronously
-            tcgplayer_results = asyncio.run(scraper.fetch_all_data_concurrent(cards_to_fetch))
-            if not tcgplayer_results:
-                logger.error(f"Could not get TCGPlayer data for {search_query} ({language}).")
-                return Response({'error': 'Could not get TCGPlayer data'}, status=404)
+            all_profit_data = asyncio.run(scraper.main_scrape(search_query, search_query, language))
 
-            logger.info("Fetching eBay prices asynchronously...")
-            ebay_prices = asyncio.run(scraper.get_ebay_prices_async(tcgplayer_results))
+            if not all_profit_data:
+                logger.error(f"Could not get data for {search_query} ({language}).")
+                return Response({'error': 'Could not get data'}, status=404)
 
             # Processing and profit calculation remains the same
             all_cards = []
-            for card_data, ebay_price in zip(tcgplayer_results, ebay_prices):
-                if ebay_price:
-                    logger.info(f"Calculating profits for {card_data.get('card_name')}")
-                    profit_data = scraper.calculate_profit([card_data], ebay_price)
-
-                    if profit_data:
-                        for card in profit_data:
-                            logger.info(f"Creating or updating record for {card.get('card_name')}")
-                            card_record, created = PokemonCard.objects.update_or_create(
-                                card_name=card.get("card_name"),
-                                set_name=card.get("set_name"),
-                                language=card.get("language"),
-                                rarity=card.get("rarity"),
-                                defaults={
-                                    'tcgplayer_price': card.get("tcgplayer_price"),
-                                    'psa_10_price': card.get("psa_10_price"),
-                                    'price_delta': card.get("price_delta"),
-                                    'profit_potential': card.get("profit_potential"),
-                                    'last_updated': timezone.now()
-                                }
-                            )
-                            all_cards.append(card_record)
-                else:
-                    logger.error(f"Could not get eBay data for {card_data.get('card_name')}")
+            for card in all_profit_data:
+                logger.info(f"Creating or updating record for {card.get('card_name')}")
+                card_record, created = PokemonCard.objects.update_or_create(
+                    card_name=card.get("card_name"),
+                    set_name=card.get("set_name"),
+                    language=card.get("language"),
+                    rarity=card.get("rarity"),
+                    defaults={
+                        'tcgplayer_price': card.get("tcgplayer_price"),
+                        'psa_10_price': card.get("psa_10_price"),
+                        'price_delta': card.get("price_delta"),
+                        'profit_potential': card.get("profit_potential"),
+                        'last_updated': timezone.now()
+                    }
+                )
+                all_cards.append(card_record)
 
             if not all_cards:
                 return Response({'error': 'No valid cards found'}, status=404)

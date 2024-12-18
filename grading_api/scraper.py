@@ -6,25 +6,32 @@ from datetime import datetime, timedelta
 import aiohttp
 from ratelimit import limits, sleep_and_retry
 import functools
+import logging
+import time
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 ONE_MINUTE = 60
-MAX_REQUESTS_PER_MINUTE = 30
+MAX_REQUESTS_PER_MINUTE_TCG = 30
+MAX_REQUESTS_PER_MINUTE_EBAY = 20  # Add rate limiting for eBay
 
-# Cache decorator
 def cache_results(func):
     cache = {}
 
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):
+    async def wrapper(*args, **kwargs):
         key = str(args) + str(kwargs)
         now = datetime.now()
 
         if key in cache:
             result, timestamp = cache[key]
             if now - timestamp < timedelta(hours=24):
+                logging.info(f"Returning cached result for {key}")
                 return result
 
-        result = func(*args, **kwargs)
+        result = await func(*args, **kwargs)
         if result:
             cache[key] = (result, now)
         return result
@@ -32,8 +39,8 @@ def cache_results(func):
     return wrapper
 
 @sleep_and_retry
-@limits(calls=MAX_REQUESTS_PER_MINUTE, period=ONE_MINUTE)
-async def fetch_tcgplayer_data(card_name, set_name, language="English"):
+@limits(calls=MAX_REQUESTS_PER_MINUTE_TCG, period=ONE_MINUTE)
+async def fetch_tcgplayer_data(card_name, set_name, language="English", context=None):
     """
     Retrieves price data for a card from TCGPlayer using Playwright.
     """
@@ -60,100 +67,101 @@ async def fetch_tcgplayer_data(card_name, set_name, language="English"):
     base_url = "https://www.tcgplayer.com/search/pokemon"
     all_card_data = []
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
+    page = await context.new_page()
 
-        for rarity in rarities:
-            try:
-                if language == "English":
-                    url = f"{base_url}/product?productLineName=pokemon&q={card_name.replace(' ', '+')}&view=grid&page=1&ProductTypeName=Cards&Rarity={rarity.replace(' ', '+')}"
-                    if set_name:
-                        url += f"&setName={set_name.replace(' ', '-').lower()}"
+    await page.route("**/*.{png,jpg,jpeg}", lambda route: route.abort())
+
+    for rarity in rarities:
+        try:
+            if language == "English":
+                url = f"{base_url}/product?productLineName=pokemon&q={card_name.replace(' ', '+')}&view=grid&page=1&ProductTypeName=Cards&Rarity={rarity.replace(' ', '+')}"
+                if set_name and set_name.lower() != card_name.lower():
+                    url += f"&setName={set_name.replace(' ', '-').lower()}"
+            else:
+                url = f"{base_url}-japan/product?productLineName=pokemon-japan&q={card_name.replace(' ', '+')}&view=grid&page=1&ProductTypeName=Cards&Rarity={rarity.replace(' ', '+')}"
+                if set_name and set_name.lower() != card_name.lower():
+                    url += f"&setName={set_name.replace(' ', '-').lower()}"
+
+            retries = 0
+            max_retries = 3
+            while retries < max_retries:
+                try:
+                    logging.info(f"Attempt {retries + 1}/{max_retries}: Fetching URL: {url}")
+                    await page.goto(url, timeout=20000, wait_until="domcontentloaded")
+
+                    try:
+                        await asyncio.wait_for(
+                            page.wait_for_selector(
+                                ".search-result, .blank-slate", state="visible", timeout=10000
+                            ),
+                            timeout=10,
+                        )
+                    except asyncio.TimeoutError:
+                        logging.warning("Neither .search-result nor .blank-slate found within timeout")
+
+                    if await page.query_selector('.search-result'):
+                        break
+                    else:
+                        logging.warning("No results found on page")
+                        break
+
+                except Exception as e:
+                    logging.error(f"Error during page navigation: {e}")
+
+                retries += 1
+                if retries < max_retries:
+                    await asyncio.sleep(2**(retries + 1))  # Exponential backoff
                 else:
-                    url = url = f"{base_url}-japan/product?productLineName=pokemon-japan&q={card_name.replace(' ', '+')}&view=grid&page=1&ProductTypeName=Cards&Rarity={rarity.replace(' ', '+')}"
-                    if set_name:
-                        url += f"&setName={set_name.replace(' ', '-').lower()}"
+                    logging.error("Max retries reached. Stopping.")
+                    return []
 
-                max_retries = 3
-                retries = 0
+            html = await page.content()
+            soup = BeautifulSoup(html, 'lxml')  # Use lxml parser
+            card_elements = soup.find_all('div', class_='search-result')
 
-                while retries < max_retries:
+            for card in card_elements:
+                try:
+                    card_title_element = card.find('span', class_='product-card__title')
+                    card_title = card_title_element.text.strip() if card_title_element else None
+
+                    price_element = card.find('span', class_='product-card__market-price--value')
+                    price_text = price_element.text.strip() if price_element else None
+
+                    set_name_element = card.find('div', class_='product-card__set-name__variant')
+                    set_name = set_name_element.text.strip() if set_name_element else None
+
+                    rarity_element = card.find('div', class_="product-card__rarity__variant")
+                    rarity_spans = rarity_element.find_all('span') if rarity_element else None
+                    rarity = rarity_spans[0].text.strip().replace(",", "") if rarity_spans and len(rarity_spans) > 0 else None
+
                     try:
-                        print(f"Attempt {retries + 1}/{max_retries}: Fetching URL: {url}")
-                        
-                        await page.goto(url, timeout=20000) 
-                        
-                        try:
-                            await page.wait_for_selector('.search-result, .blank-slate', timeout=30000)
-                            print("Page loaded successfully!")
-                            
-                            if await page.query_selector('.search-result'):
-                                break
-                            else:
-                                print("No results found on page")
-                                break
-                                
-                        except Exception as e:
-                            print(f"Error waiting for selector: {e}")
-                            
-                    except Exception as e:
-                        print(f"Error during page navigation: {e}")
-                        
-                    retries += 1
-                    if retries == max_retries:
-                        print("Max retries reached. Stopping.")
-                        return []
-                        
-                    await asyncio.sleep(2)
+                        price = float(price_text.replace('$', '')) if price_text else None
+                    except (ValueError, AttributeError):
+                        price = None
 
-                html = await page.content()
-                soup = BeautifulSoup(html, 'html.parser')
-                card_elements = soup.find_all('div', class_='search-result')
+                    if card_title and price and card_name.lower() in card_title.lower() and rarity in rarities:
+                        all_card_data.append({
+                            "card_name": card_title,
+                            "set_name": set_name,
+                            "language": language,
+                            "rarity": rarity,
+                            "tcgplayer_price": price
+                        })
+                except Exception as e:
+                    logging.error(f"Error processing card element: {e}")
+                    continue
 
-                for card in card_elements:
-                    try:
-                        card_title_element = card.find('span', class_='product-card__title')
-                        card_title = card_title_element.text.strip() if card_title_element else None
+        except Exception as e:
+            logging.error(f"Error fetching data for rarity {rarity}: {e}")
 
-                        price_element = card.find('span', class_='product-card__market-price--value')
-                        price_text = price_element.text.strip() if price_element else None
-
-                        set_name_element = card.find('div', class_='product-card__set-name__variant')
-                        set_name = set_name_element.text.strip() if set_name_element else None
-
-                        rarity_element = card.find('div', class_="product-card__rarity__variant")
-                        rarity_spans = rarity_element.find_all('span') if rarity_element else None
-                        rarity = rarity_spans[0].text.strip().replace(",", "") if rarity_spans and len(rarity_spans) > 0 else None
-
-                        try:
-                            price = float(price_text.replace('$', '')) if price_text else None
-                        except (ValueError, AttributeError):
-                            price = None
-
-                        if card_title and price and card_name.lower() in card_title.lower() and rarity in rarities:
-                            all_card_data.append({
-                                "card_name": card_title,
-                                "set_name": set_name,
-                                "language": language,
-                                "rarity": rarity,
-                                "tcgplayer_price": price
-                            })
-                    except Exception as e:
-                        print(f"Error processing card element: {e}")
-                        continue
-
-            except Exception as e:
-                print(f"Error fetching data for rarity {rarity}: {e}")
-
-        await browser.close()
-
+    await page.close()
     return all_card_data
 
+@sleep_and_retry
+@limits(calls=MAX_REQUESTS_PER_MINUTE_EBAY, period=ONE_MINUTE)
 async def get_ebay_psa10_price_async(session, card_name, set_name):
     """
-    Asynchronous eBay price fetching.
+    Asynchronous eBay price fetching with rate limiting.
     """
     base_url = "https://www.ebay.com/sch/i.html"
     search_query = f"{card_name} {set_name} psa 10"
@@ -169,7 +177,7 @@ async def get_ebay_psa10_price_async(session, card_name, set_name):
     try:
         async with session.get(base_url, params=params) as response:
             html = await response.text()
-            soup = BeautifulSoup(html, "html.parser")
+            soup = BeautifulSoup(html, "lxml")
 
             sold_items = soup.find_all("li", class_="s-item s-item__pl-on-bottom")
             prices = []
@@ -185,22 +193,23 @@ async def get_ebay_psa10_price_async(session, card_name, set_name):
 
             if prices:
                 average_price = sum(prices) / len(prices)
-                print(f"Average PSA 10 price on eBay for {card_name} {set_name}: ${average_price}")
+                logging.info(f"Average PSA 10 price on eBay for {card_name} {set_name}: ${average_price}")
                 return average_price
             return None
 
     except Exception as e:
-        print(f"Error fetching eBay data: {e}")
+        logging.error(f"Error fetching eBay data: {e}")
         return None
 
-async def get_ebay_prices_async(cards):
-    async with aiohttp.ClientSession() as session:
-        tasks = [
-            asyncio.ensure_future(
-                get_ebay_psa10_price_async(session, card['card_name'], card['set_name'])
-            ) for card in cards
-        ]
-        return await asyncio.gather(*tasks)
+async def get_ebay_prices_async(session, cards):
+    """
+    Fetches eBay prices concurrently with a shared session.
+    """
+    tasks = [
+        get_ebay_psa10_price_async(session, card['card_name'], card['set_name'])
+        for card in cards
+    ]
+    return await asyncio.gather(*tasks)
 
 def calculate_profit(tcgplayer_data, ebay_price):
     """
@@ -218,41 +227,33 @@ def calculate_profit(tcgplayer_data, ebay_price):
             card["profit_potential"] = profit_potential * 100
             all_profit_data.append(card)
         else:
-            print(f"Could not get eBay price or TCGPlayer price for {card.get('card_name')}")
+            logging.warning(f"Could not get eBay price or TCGPlayer price for {card.get('card_name')}")
 
     return all_profit_data
-
-async def fetch_all_data_concurrent(cards_to_fetch):
-    """
-    Fetches TCGPlayer data concurrently for multiple cards.
-    """
-    tasks = [
-        fetch_tcgplayer_data(card['name'], card['set'], card.get('language', 'English'))
-        for card in cards_to_fetch
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    # Handle errors and return valid results
-    all_results = []
-    for result in results:
-        if isinstance(result, list):  # Expecting a list of cards from fetch_tcgplayer_data
-            all_results.extend(result)
-        elif isinstance(result, Exception):
-            print(f"Error: {result}")
-    return all_results
 
 async def main_scrape(card_name, set_name, language="English"):
-    cards_to_fetch = [{'name': card_name, 'set': set_name, 'language': language}]
-    tcgplayer_results = await fetch_tcgplayer_data(card_name, set_name, language)
-    ebay_prices = await get_ebay_prices_async(tcgplayer_results)
+    start_time = time.perf_counter()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
 
-    all_profit_data = []
-    for card_data, ebay_price in zip(tcgplayer_results, ebay_prices):
-        if ebay_price:
-            profit_data = calculate_profit([card_data], ebay_price)
-            if profit_data:
-                all_profit_data.extend(profit_data)
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=15)) as session:  # Add connection pooling
+            tcgplayer_results = await fetch_tcgplayer_data(card_name, set_name, language, context)
+            ebay_prices = await get_ebay_prices_async(session, tcgplayer_results)
 
-    return all_profit_data
+            all_profit_data = []
+            for card_data, ebay_price in zip(tcgplayer_results, ebay_prices):
+                if ebay_price:
+                    profit_data = calculate_profit([card_data], ebay_price)
+                    if profit_data:
+                        all_profit_data.extend(profit_data)
+
+            await browser.close()
+            end_time = time.perf_counter()  # Get the ending time
+            elapsed_time = end_time - start_time
+
+            print(f"Scraping completed in {elapsed_time:.2f} seconds")
+            return all_profit_data
 
 if __name__ == "__main__":
     cards_to_fetch = [
@@ -260,4 +261,14 @@ if __name__ == "__main__":
         {'name': 'Mew ex', 'set': 'Pokemon Card 151', 'language': 'Japanese'}
     ]
 
-    asyncio.run(main_scrape('Charizard ex', 'Obsidian Flames', 'English'))
+    async def run_main():
+        results = []
+        for card in cards_to_fetch:
+            result = await main_scrape(card['name'], card['set'], card['language'])
+            results.append(result)
+        
+        # Flatten the list of lists if needed
+        flat_results = [item for sublist in results for item in sublist]
+        print(flat_results)
+
+    asyncio.run(run_main())
