@@ -229,9 +229,13 @@ def extract_card_data(card_element: BeautifulSoup, card_details: CardDetails, ra
 @sleep_and_retry
 @limits(calls=Config.MAX_REQUESTS_PER_MINUTE_EBAY, period=Config.ONE_MINUTE)
 async def get_ebay_psa10_price_async(session: aiohttp.ClientSession, card_details: CardDetails) -> Optional[float]:
-    """Fetches PSA 10 prices from eBay with improved error handling"""
+    """Fetches PSA 10 prices from eBay with improved error handling and specific card matching"""
+    search_query = f"{card_details.name} {card_details.set_name} PSA 10"
+    if card_details.language == "Japanese":
+        search_query += " Japanese"
+    
     params = {
-        "_nkw": f"{card_details.name} {card_details.set_name} psa 10",
+        "_nkw": search_query,
         "_sacat": 0,
         "_from": "R40",
         "rt": "nc",
@@ -249,7 +253,7 @@ async def get_ebay_psa10_price_async(session: aiohttp.ClientSession, card_detail
                 raise RequestError(f"eBay returned status code {response.status}")
                 
             html = await response.text()
-            prices = extract_ebay_prices(html)
+            prices = extract_ebay_prices(html, card_details)
             
             if not prices:
                 logger.warning(f"No valid prices found for {card_details.name}")
@@ -258,15 +262,48 @@ async def get_ebay_psa10_price_async(session: aiohttp.ClientSession, card_detail
             return calculate_average_price(prices)
             
     except Exception as e:
-        logger.error(f"Error fetching eBay data: {str(e)}", exc_info=True)
+        logger.error(f"Error fetching eBay data for {card_details.name}: {str(e)}", exc_info=True)
         return None
 
-def extract_ebay_prices(html: str) -> List[float]:
-    """Extracts prices from eBay HTML"""
+def extract_ebay_prices(html: str, card_details: CardDetails) -> List[float]:
+    """Extracts prices from eBay HTML with improved card matching"""
     soup = BeautifulSoup(html, "lxml")
     prices = []
     
+    # Extract key components from the search query
+    search_parts = card_details.name.lower().split()
+    card_name = search_parts[0]  # Base card name (e.g., "pikachu")
+    
+    # Look for card number pattern (e.g., "123/456")
+    card_number = next((part for part in search_parts if re.match(r'\d+/\d+', part)), None)
+    
+    # Extract rarity keywords
+    rarity_keywords = [word.lower() for word in search_parts if word.lower() in 
+                      ['illustration', 'special', 'hyper', 'rare', 'art', 'super', 'ultra']]
+    
     for item in soup.find_all("li", class_="s-item s-item__pl-on-bottom"):
+        title = item.find("div", class_="s-item__title")
+        if not title:
+            continue
+            
+        title_text = title.text.strip().lower()
+        
+        # Must have the base card name and PSA 10
+        if card_name not in title_text or "psa 10" not in title_text:
+            continue
+            
+        # If we have a card number, it should be present
+        if card_number and card_number not in title_text:
+            continue
+            
+        # Check for at least one rarity keyword match if rarity keywords exist
+        if rarity_keywords and not any(keyword in title_text for keyword in rarity_keywords):
+            continue
+            
+        # Skip if it's not a PSA 10
+        if "psa 10" not in title_text:
+            continue
+            
         if price_span := item.find("span", class_="s-item__price"):
             if price_match := re.search(r'\$([\d,]+\.?\d*)', price_span.text.strip()):
                 try:
@@ -313,14 +350,33 @@ async def process_card_batch(
             
         if not tcg_result:
             continue
+        
+        # Process each rarity variant separately
+        for card_data in tcg_result:
+            # Create card details specific to this rarity variant
+            variant_details = CardDetails(
+                name=card_data.card_name,
+                set_name=card_data.set_name,
+                language=card_data.language
+            )
             
-        ebay_price = await get_ebay_psa10_price_async(session, card_details)
-        if ebay_price:
-            for card_data in tcg_result:
+            # Get eBay price for this specific variant
+            # Extract card number if present
+            card_number_match = re.search(r'[-\s](\d+/\d+)', card_data.card_name)
+            card_number = card_number_match.group(1) if card_number_match else ""
+            
+            # Create a more focused but not overly specific search query
+            base_name = variant_details.name.split(' - ')[0].strip()  # Get the base card name
+            search_query = f"{base_name} {card_number} {card_data.rarity} PSA 10"
+            variant_details.name = search_query
+            ebay_price = await get_ebay_psa10_price_async(session, variant_details)
+            logger.info(f"eBay prices for {search_query}: {ebay_price}")
+            
+            if ebay_price:
                 card_data.psa_10_price = ebay_price
                 card_data.price_delta = ebay_price - card_data.tcgplayer_price
                 card_data.profit_potential = (card_data.price_delta / card_data.tcgplayer_price) * 100
-                all_price_data.append(card_data)
+            all_price_data.append(card_data)
                 
     return all_price_data
 
