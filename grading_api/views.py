@@ -111,9 +111,7 @@ class PokemonCardViewSet(viewsets.ModelViewSet):
                 )
 
             serializer = self.serializer_class(saved_cards, many=True)
-            return Response({
-                "cards": serializer.data
-            })
+            return Response(serializer.data)
 
         except Exception as e:
             logger.error(f"Error processing request: {str(e)}", exc_info=True)
