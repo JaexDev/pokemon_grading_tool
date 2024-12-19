@@ -23,16 +23,17 @@ The API looks like this
 
 ```json
     {
-        "id": 10,
+        "id": 3,
         "card_name": "Pikachu ex - 247/191",
         "set_name": "SV08: Surging Sparks",
         "language": "English",
         "rarity": "Hyper Rare",
-        "tcgplayer_price": 165.4,
-        "psa_10_price": 220.03731343283582,
-        "price_delta": 54.63731343283581,
-        "profit_potential": 33.033442220577875,
-        "last_updated": "2024-12-15T14:24:51.390226Z"
+        "tcgplayer_price": "151.79",
+        "psa_10_price": "124.39",
+        "price_delta": "-27.40",
+        "profit_potential": "-18.05",
+        "last_updated": "2024-12-19T11:38:24.616024Z",
+        "created_at": "2024-12-19T11:35:54.012028Z"
     },
 ```
 
