@@ -8,267 +8,363 @@ from ratelimit import limits, sleep_and_retry
 import functools
 import logging
 import time
+from typing import List, Dict, Optional, Any
+from dataclasses import dataclass
+from aiohttp import ClientTimeout
+import json
 
+# Data classes for type safety and better structure
+@dataclass
+class CardDetails:
+    name: str
+    set_name: str
+    language: str = "English"
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+@dataclass
+class CardPriceData:
+    card_name: str
+    set_name: str
+    language: str
+    rarity: str
+    tcgplayer_price: float
+    psa_10_price: Optional[float] = None
+    price_delta: Optional[float] = None
+    profit_potential: Optional[float] = None
 
-ONE_MINUTE = 60
-MAX_REQUESTS_PER_MINUTE_TCG = 30
-MAX_REQUESTS_PER_MINUTE_EBAY = 20  # Add rate limiting for eBay
-
-def cache_results(func):
-    cache = {}
-
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        key = str(args) + str(kwargs)
-        now = datetime.now()
-
-        if key in cache:
-            result, timestamp = cache[key]
-            if now - timestamp < timedelta(hours=24):
-                logging.info(f"Returning cached result for {key}")
-                return result
-
-        result = await func(*args, **kwargs)
-        if result:
-            cache[key] = (result, now)
-        return result
-
-    return wrapper
-
-@sleep_and_retry
-@limits(calls=MAX_REQUESTS_PER_MINUTE_TCG, period=ONE_MINUTE)
-async def fetch_tcgplayer_data(card_name, set_name, language="English", context=None):
-    """
-    Retrieves price data for a card from TCGPlayer using Playwright.
-    """
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    }
-
-    if language == "English":
-        rarities = [
+# Configuration
+class Config:
+    ONE_MINUTE = 60
+    MAX_REQUESTS_PER_MINUTE_TCG = 30
+    MAX_REQUESTS_PER_MINUTE_EBAY = 20
+    CACHE_DURATION_HOURS = 24
+    MAX_RETRIES = 3
+    TIMEOUT_SECONDS = 30
+    
+    RARITY_MAPPING = {
+        "English": [
             "Special Illustration Rare",
             "Illustration Rare",
             "Hyper Rare"
-        ]
-    elif language == "Japanese":
-        rarities = [
+        ],
+        "Japanese": [
             "Art Rare",
             "Super Rare",
             "Special Art Rare",
             "Ultra Rare"
         ]
-    else:
-        raise ValueError("Language must be English or Japanese")
+    }
 
-    base_url = "https://www.tcgplayer.com/search/pokemon"
+# Configure logging with more detailed format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class PriceCache:
+    def __init__(self):
+        self.cache = {}
+        self.filename = "price_cache.json"
+        self.load_cache()
+
+    def load_cache(self):
+        try:
+            with open(self.filename, 'r') as f:
+                cache_data = json.load(f)
+                self.cache = {
+                    k: (v['data'], datetime.fromisoformat(v['timestamp']))
+                    for k, v in cache_data.items()
+                }
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.cache = {}
+
+    def save_cache(self):
+        cache_data = {
+            k: {
+                'data': v[0],
+                'timestamp': v[1].isoformat()
+            }
+            for k, v in self.cache.items()
+        }
+        with open(self.filename, 'w') as f:
+            json.dump(cache_data, f)
+
+    def get(self, key: str) -> Optional[Any]:
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if datetime.now() - timestamp < timedelta(hours=Config.CACHE_DURATION_HOURS):
+                return data
+            else:
+                del self.cache[key]
+        return None
+
+    def set(self, key: str, value: Any):
+        self.cache[key] = (value, datetime.now())
+        self.save_cache()
+
+price_cache = PriceCache()
+
+def cache_results(func):
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        key = f"{func.__name__}:{str(args)}:{str(kwargs)}"
+        cached_result = price_cache.get(key)
+        
+        if cached_result:
+            logger.info(f"Cache hit for {key}")
+            return cached_result
+
+        result = await func(*args, **kwargs)
+        if result:
+            price_cache.set(key, result)
+        return result
+
+    return wrapper
+
+class RequestError(Exception):
+    pass
+
+@sleep_and_retry
+@limits(calls=Config.MAX_REQUESTS_PER_MINUTE_TCG, period=Config.ONE_MINUTE)
+async def fetch_tcgplayer_data(card_details: CardDetails, context) -> List[CardPriceData]:
+    """
+    Enhanced TCGPlayer data fetching with better error handling and typing
+    """
+    if card_details.language not in Config.RARITY_MAPPING:
+        raise ValueError(f"Unsupported language: {card_details.language}")
+
     all_card_data = []
-
     page = await context.new_page()
-
     await page.route("**/*.{png,jpg,jpeg}", lambda route: route.abort())
 
-    for rarity in rarities:
+    for rarity in Config.RARITY_MAPPING[card_details.language]:
         try:
-            if language == "English":
-                url = f"{base_url}/product?productLineName=pokemon&q={card_name.replace(' ', '+')}&view=grid&page=1&ProductTypeName=Cards&Rarity={rarity.replace(' ', '+')}"
-                if set_name and set_name.lower() != card_name.lower():
-                    url += f"&setName={set_name.replace(' ', '-').lower()}"
-            else:
-                url = f"{base_url}-japan/product?productLineName=pokemon-japan&q={card_name.replace(' ', '+')}&view=grid&page=1&ProductTypeName=Cards&Rarity={rarity.replace(' ', '+')}"
-                if set_name and set_name.lower() != card_name.lower():
-                    url += f"&setName={set_name.replace(' ', '-').lower()}"
-
-            retries = 0
-            max_retries = 3
-            while retries < max_retries:
-                try:
-                    logging.info(f"Attempt {retries + 1}/{max_retries}: Fetching URL: {url}")
-                    await page.goto(url, timeout=20000, wait_until="domcontentloaded")
-
-                    try:
-                        await asyncio.wait_for(
-                            page.wait_for_selector(
-                                ".search-result, .blank-slate", state="visible", timeout=10000
-                            ),
-                            timeout=10,
-                        )
-                    except asyncio.TimeoutError:
-                        logging.warning("Neither .search-result nor .blank-slate found within timeout")
-
-                    if await page.query_selector('.search-result'):
-                        break
-                    else:
-                        logging.warning("No results found on page")
-                        break
-
-                except Exception as e:
-                    logging.error(f"Error during page navigation: {e}")
-
-                retries += 1
-                if retries < max_retries:
-                    await asyncio.sleep(2**(retries + 1))  # Exponential backoff
-                else:
-                    logging.error("Max retries reached. Stopping.")
-                    return []
-
-            html = await page.content()
-            soup = BeautifulSoup(html, 'lxml')  # Use lxml parser
-            card_elements = soup.find_all('div', class_='search-result')
-
-            for card in card_elements:
-                try:
-                    card_title_element = card.find('span', class_='product-card__title')
-                    card_title = card_title_element.text.strip() if card_title_element else None
-
-                    price_element = card.find('span', class_='product-card__market-price--value')
-                    price_text = price_element.text.strip() if price_element else None
-
-                    set_name_element = card.find('div', class_='product-card__set-name__variant')
-                    set_name = set_name_element.text.strip() if set_name_element else None
-
-                    rarity_element = card.find('div', class_="product-card__rarity__variant")
-                    rarity_spans = rarity_element.find_all('span') if rarity_element else None
-                    rarity = rarity_spans[0].text.strip().replace(",", "") if rarity_spans and len(rarity_spans) > 0 else None
-
-                    try:
-                        price = float(price_text.replace('$', '')) if price_text else None
-                    except (ValueError, AttributeError):
-                        price = None
-
-                    if card_title and price and card_name.lower() in card_title.lower() and rarity in rarities:
-                        all_card_data.append({
-                            "card_name": card_title,
-                            "set_name": set_name,
-                            "language": language,
-                            "rarity": rarity,
-                            "tcgplayer_price": price
-                        })
-                except Exception as e:
-                    logging.error(f"Error processing card element: {e}")
-                    continue
-
+            url = build_tcgplayer_url(card_details, rarity)
+            await fetch_and_process_page(page, url, card_details, rarity, all_card_data)
         except Exception as e:
-            logging.error(f"Error fetching data for rarity {rarity}: {e}")
+            logger.error(f"Error processing rarity {rarity}: {str(e)}", exc_info=True)
+        finally:
+            await asyncio.sleep(1)  # Gentle delay between requests
 
     await page.close()
     return all_card_data
 
-@sleep_and_retry
-@limits(calls=MAX_REQUESTS_PER_MINUTE_EBAY, period=ONE_MINUTE)
-async def get_ebay_psa10_price_async(session, card_name, set_name):
-    """
-    Asynchronous eBay price fetching with rate limiting.
-    """
-    base_url = "https://www.ebay.com/sch/i.html"
-    search_query = f"{card_name} {set_name} psa 10"
+def build_tcgplayer_url(card_details: CardDetails, rarity: str) -> str:
+    """Constructs the TCGPlayer URL based on card details"""
+    base = "https://www.tcgplayer.com/search/pokemon"
+    if card_details.language == "Japanese":
+        base += "-japan"
+    
     params = {
-        "_nkw": search_query,
+        "productLineName": "pokemon" if card_details.language == "English" else "pokemon-japan",
+        "q": card_details.name.replace(" ", "+"),
+        "view": "grid",
+        "page": "1",
+        "ProductTypeName": "Cards",
+        "Rarity": rarity.replace(" ", "+")
+    }
+    
+    if card_details.set_name and card_details.set_name.lower() != card_details.name.lower():
+        params["setName"] = card_details.set_name.replace(" ", "-").lower()
+    
+    query_string = "&".join(f"{k}={v}" for k, v in params.items())
+    return f"{base}/product?{query_string}"
+
+async def fetch_and_process_page(page, url: str, card_details: CardDetails, rarity: str, all_card_data: List[CardPriceData]):
+    """Fetches and processes a single TCGPlayer page"""
+    for attempt in range(Config.MAX_RETRIES):
+        try:
+            await page.goto(url, timeout=Config.TIMEOUT_SECONDS * 1000)
+            await page.wait_for_selector(".search-result, .blank-slate", timeout=10000)
+            
+            html = await page.content()
+            soup = BeautifulSoup(html, 'lxml')
+            
+            if cards := process_card_elements(soup, card_details, rarity):
+                all_card_data.extend(cards)
+                break
+            
+        except Exception as e:
+            logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+            if attempt == Config.MAX_RETRIES - 1:
+                raise
+            await asyncio.sleep(2 ** (attempt + 1))
+
+def process_card_elements(soup: BeautifulSoup, card_details: CardDetails, rarity: str) -> List[CardPriceData]:
+    """Processes card elements from the page HTML"""
+    cards = []
+    for card in soup.find_all('div', class_='search-result'):
+        try:
+            if card_data := extract_card_data(card, card_details, rarity):
+                cards.append(card_data)
+        except Exception as e:
+            logger.error(f"Error processing card element: {str(e)}", exc_info=True)
+    return cards
+
+def extract_card_data(card_element: BeautifulSoup, card_details: CardDetails, rarity: str) -> Optional[CardPriceData]:
+    """Extracts data from a single card element"""
+    title = card_element.find('span', class_='product-card__title')
+    price = card_element.find('span', class_='product-card__market-price--value')
+    set_name = card_element.find('div', class_='product-card__set-name__variant')
+    
+    if not all([title, price, set_name]):
+        return None
+        
+    try:
+        price_value = float(price.text.strip().replace('$', ''))
+    except (ValueError, AttributeError):
+        return None
+        
+    if card_details.name.lower() not in title.text.strip().lower():
+        return None
+        
+    return CardPriceData(
+        card_name=title.text.strip(),
+        set_name=set_name.text.strip(),
+        language=card_details.language,
+        rarity=rarity,
+        tcgplayer_price=price_value
+    )
+
+@sleep_and_retry
+@limits(calls=Config.MAX_REQUESTS_PER_MINUTE_EBAY, period=Config.ONE_MINUTE)
+async def get_ebay_psa10_price_async(session: aiohttp.ClientSession, card_details: CardDetails) -> Optional[float]:
+    """Fetches PSA 10 prices from eBay with improved error handling"""
+    params = {
+        "_nkw": f"{card_details.name} {card_details.set_name} psa 10",
         "_sacat": 0,
         "_from": "R40",
         "rt": "nc",
         "LH_Sold": 1,
         "LH_Complete": 1
     }
-
+    
     try:
-        async with session.get(base_url, params=params) as response:
+        async with session.get(
+            "https://www.ebay.com/sch/i.html",
+            params=params,
+            timeout=ClientTimeout(total=Config.TIMEOUT_SECONDS)
+        ) as response:
+            if response.status != 200:
+                raise RequestError(f"eBay returned status code {response.status}")
+                
             html = await response.text()
-            soup = BeautifulSoup(html, "lxml")
-
-            sold_items = soup.find_all("li", class_="s-item s-item__pl-on-bottom")
-            prices = []
-
-            for item in sold_items:
-                price_span = item.find("span", class_="s-item__price")
-                if price_span:
-                    price_text = price_span.text.strip()
-                    price_match = re.search(r'\$([\d.]+)', price_text)
-                    if price_match:
-                        price = float(price_match.group(1))
-                        prices.append(price)
-
-            if prices:
-                average_price = sum(prices) / len(prices)
-                logging.info(f"Average PSA 10 price on eBay for {card_name} {set_name}: ${average_price}")
-                return average_price
-            return None
-
+            prices = extract_ebay_prices(html)
+            
+            if not prices:
+                logger.warning(f"No valid prices found for {card_details.name}")
+                return None
+                
+            return calculate_average_price(prices)
+            
     except Exception as e:
-        logging.error(f"Error fetching eBay data: {e}")
+        logger.error(f"Error fetching eBay data: {str(e)}", exc_info=True)
         return None
 
-async def get_ebay_prices_async(session, cards):
-    """
-    Fetches eBay prices concurrently with a shared session.
-    """
-    tasks = [
-        get_ebay_psa10_price_async(session, card['card_name'], card['set_name'])
-        for card in cards
+def extract_ebay_prices(html: str) -> List[float]:
+    """Extracts prices from eBay HTML"""
+    soup = BeautifulSoup(html, "lxml")
+    prices = []
+    
+    for item in soup.find_all("li", class_="s-item s-item__pl-on-bottom"):
+        if price_span := item.find("span", class_="s-item__price"):
+            if price_match := re.search(r'\$([\d,]+\.?\d*)', price_span.text.strip()):
+                try:
+                    price = float(price_match.group(1).replace(',', ''))
+                    prices.append(price)
+                except ValueError:
+                    continue
+                    
+    return prices
+
+def calculate_average_price(prices: List[float]) -> float:
+    """Calculates average price with optional outlier removal"""
+    if len(prices) < 3:
+        return sum(prices) / len(prices)
+        
+    # Remove outliers using IQR method
+    prices.sort()
+    q1 = prices[len(prices)//4]
+    q3 = prices[3*len(prices)//4]
+    iqr = q3 - q1
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    
+    filtered_prices = [p for p in prices if lower_bound <= p <= upper_bound]
+    return sum(filtered_prices) / len(filtered_prices)
+
+async def process_card_batch(
+    card_details_list: List[CardDetails],
+    browser_context,
+    session: aiohttp.ClientSession
+) -> List[CardPriceData]:
+    """Processes a batch of cards concurrently"""
+    tcg_tasks = [
+        fetch_tcgplayer_data(card_details, browser_context)
+        for card_details in card_details_list
     ]
-    return await asyncio.gather(*tasks)
+    tcg_results = await asyncio.gather(*tcg_tasks, return_exceptions=True)
+    
+    all_price_data = []
+    for card_details, tcg_result in zip(card_details_list, tcg_results):
+        if isinstance(tcg_result, Exception):
+            logger.error(f"Error processing {card_details.name}: {str(tcg_result)}")
+            continue
+            
+        if not tcg_result:
+            continue
+            
+        ebay_price = await get_ebay_psa10_price_async(session, card_details)
+        if ebay_price:
+            for card_data in tcg_result:
+                card_data.psa_10_price = ebay_price
+                card_data.price_delta = ebay_price - card_data.tcgplayer_price
+                card_data.profit_potential = (card_data.price_delta / card_data.tcgplayer_price) * 100
+                all_price_data.append(card_data)
+                
+    return all_price_data
 
-def calculate_profit(tcgplayer_data, ebay_price):
-    """
-    Calculates profit potential for grading cards.
-    """
-    all_profit_data = []
-    for card in tcgplayer_data:
-        ungraded_price = card.get("tcgplayer_price")
-
-        if ungraded_price and ebay_price:
-            price_delta = ebay_price - ungraded_price
-            profit_potential = (price_delta) / ungraded_price
-            card["psa_10_price"] = ebay_price
-            card["price_delta"] = price_delta
-            card["profit_potential"] = profit_potential * 100
-            all_profit_data.append(card)
-        else:
-            logging.warning(f"Could not get eBay price or TCGPlayer price for {card.get('card_name')}")
-
-    return all_profit_data
-
-async def main_scrape(card_name, set_name, language="English"):
+async def main(card_details_list: List[CardDetails]) -> List[CardPriceData]:
+    """Main entry point with improved error handling and performance monitoring"""
     start_time = time.perf_counter()
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=15)) as session:  # Add connection pooling
-            tcgplayer_results = await fetch_tcgplayer_data(card_name, set_name, language, context)
-            ebay_prices = await get_ebay_prices_async(session, tcgplayer_results)
-
-            all_profit_data = []
-            for card_data, ebay_price in zip(tcgplayer_results, ebay_prices):
-                if ebay_price:
-                    profit_data = calculate_profit([card_data], ebay_price)
-                    if profit_data:
-                        all_profit_data.extend(profit_data)
-
+    
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=10),
+                timeout=ClientTimeout(total=Config.TIMEOUT_SECONDS)
+            ) as session:
+                results = await process_card_batch(card_details_list, context, session)
+                
             await browser.close()
-            end_time = time.perf_counter()  # Get the ending time
-            elapsed_time = end_time - start_time
-
-            print(f"Scraping completed in {elapsed_time:.2f} seconds")
-            return all_profit_data
+            
+    except Exception as e:
+        logger.error(f"Critical error in main: {str(e)}", exc_info=True)
+        raise
+        
+    finally:
+        elapsed_time = time.perf_counter() - start_time
+        logger.info(f"Script completed in {elapsed_time:.2f} seconds")
+        
+    return results
 
 if __name__ == "__main__":
     cards_to_fetch = [
-        {'name': 'Charizard ex', 'set': 'Obsidian Flames', 'language': 'English'},
-        {'name': 'Mew ex', 'set': 'Pokemon Card 151', 'language': 'Japanese'}
+        CardDetails(name="Charizard ex", set_name="Obsidian Flames", language="English"),
+        CardDetails(name="Mew ex", set_name="Pokemon Card 151", language="Japanese")
     ]
-
-    async def run_main():
-        results = []
-        for card in cards_to_fetch:
-            result = await main_scrape(card['name'], card['set'], card['language'])
-            results.append(result)
-        
-        # Flatten the list of lists if needed
-        flat_results = [item for sublist in results for item in sublist]
-        print(flat_results)
-
-    asyncio.run(run_main())
+    
+    results = asyncio.run(main(cards_to_fetch))
+    
+    # Print results in a formatted way
+    for card in results:
+        print("\nCard Details:")
+        print(f"Name: {card.card_name}")
+        print(f"Set: {card.set_name}")
+        print(f"Rarity: {card.rarity}")
+        print(f"TCGPlayer Price: ${card.tcgplayer_price:.2f}")
+        print(f"PSA 10 Price: ${card.psa_10_price:.2f}")
+        print(f"Potential Profit: {card.profit_potential:.1f}%")
