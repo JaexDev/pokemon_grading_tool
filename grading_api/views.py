@@ -29,10 +29,10 @@ class PokemonCardFilter(filters.FilterSet):
         choices=PokemonCard.LANGUAGE_CHOICES,
         field_name='language'
     )
-    
+
     price_range = filters.RangeFilter(field_name='tcgplayer_price')
     profit_range = filters.RangeFilter(field_name='profit_potential')
-    
+
     class Meta:
         model = PokemonCard
         fields = ['card_name', 'set_name', 'language', 'rarity']
