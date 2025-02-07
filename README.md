@@ -43,7 +43,7 @@ docker-compose exec web python manage.py migrate
 
 Create `.env` file with these variables:
 ```ini
-DEBUG=True
+DEBUG=False
 SECRET_KEY=your-django-secret-key
 
 ```
