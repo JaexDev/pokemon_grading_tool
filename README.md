@@ -45,8 +45,7 @@ Create `.env` file with these variables:
 ```ini
 DEBUG=True
 SECRET_KEY=your-django-secret-key
-TCGPLAYER_API_KEY=your-tcgplayer-key
-EBAY_API_KEY=your-ebay-key
+
 ```
 
 ## API Documentation
