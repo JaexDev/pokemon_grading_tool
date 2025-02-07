@@ -1,12 +1,41 @@
-chromedriver.exe
-
-*.pyc
-*.pyo
-
+*.py[cod]
 __pycache__/
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+bin/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+venv/
+myenv/
+.env
 
-db.sqlite3
+# Django
 *.log
 *.pot
 *.pyc
-*.pyo
+db.sqlite3
+media/
+staticfiles/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+
+# macOS
+.DS_Store
+
+# Environment variables
+.env
+.env.local
